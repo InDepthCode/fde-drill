@@ -251,6 +251,9 @@ details.m .body { padding: 12px 16px 16px; display: grid; gap: 10px; }
 .ans pre.code { margin-top: 6px; font-size: 12.5px; }
 .sv { display: grid; gap: 8px; border-top: 1px dashed var(--line); padding-top: 10px; }
 .sync { color: var(--muted); font-size: 12.5px; text-align: center; }
+.backup { display: flex; flex-wrap: wrap; gap: 6px 10px; justify-content: center; align-items: center; color: var(--muted); font-size: 12.5px; margin-top: -6px; }
+.backup label.linkbtn { cursor: pointer; }
+.backup-confirm { border-color: var(--accent); }
 .empty { background: var(--sunk); border-radius: var(--r); padding: 16px; color: var(--muted); }
 select.deck { font: inherit; font-size: 15px; padding: 9px 12px; border: 1.5px solid var(--line); border-radius: var(--r); background: var(--surface); color: var(--ink); width: 100%; }
 
@@ -314,6 +317,63 @@ async function flush() {
 }
 function setSync(m) { syncMode = m; const el = document.getElementById("sync"); if (el) el.textContent = syncText(); }
 function syncText() { return syncMode === "account" ? "Progress syncs to your Claude account." : "Progress is saved in this browser."; }
+
+/* ---------- backup & restore (standalone site only; the claude.ai version syncs instead) ---------- */
+const STANDALONE = !(window.claude && window.claude.use);
+const STATE_KEYS = ["status", "statusAt", "tasks", "cards", "activity", "puzzle"];
+let pendingRestore = null, backupMsg = "";
+function lastBackup() { try { return +localStorage.getItem(LS_KEY + "-backup") || 0; } catch (e) { return 0; } }
+function ago(ms) { const d = Math.floor((Date.now() - ms) / 86400000); return d <= 0 ? "today" : d === 1 ? "yesterday" : d + " days ago"; }
+function progressSummary(st) {
+  const solved = Object.values(st.status || {}).filter(v => v === "solved").length;
+  const tried = Object.keys(st.status || {}).length, cards = Object.keys(st.cards || {}).length;
+  return `${tried} problem${tried === 1 ? "" : "s"} marked (${solved} solved), ${cards} card${cards === 1 ? "" : "s"} rated, ${Object.keys(st.activity || {}).length} active day${Object.keys(st.activity || {}).length === 1 ? "" : "s"}`;
+}
+function backupHtml() {
+  if (!STANDALONE) return "";
+  if (pendingRestore) return `<section class="panel backup-confirm" role="alert">
+      <h3 style="font-size:16px">Restore this backup?</h3>
+      <p>Saved ${esc(pendingRestore.when)}: ${esc(progressSummary(pendingRestore.state))}.</p>
+      <p class="muted small">This replaces the progress in this browser (${esc(progressSummary(state))}).</p>
+      <div class="btnrow"><button class="btn primary" data-act="restoreYes">Restore</button><button class="btn" data-act="restoreNo">Cancel</button></div>
+    </section>`;
+  const lb = lastBackup();
+  return `<div class="backup">
+      <button class="linkbtn small" data-act="backup">Back up progress</button>
+      <span aria-hidden="true">·</span>
+      <label class="linkbtn small" tabindex="0">Restore from file<input type="file" id="restoreFile" accept=".json,application/json" hidden></label>
+      <span class="muted small" id="backupMsg">${esc(backupMsg || (lb ? "Last backup " + ago(lb) : "No backup yet"))}</span>
+    </div>`;
+}
+function doBackup() {
+  const payload = { app: "fde-drill", version: 1, exportedAt: new Date().toISOString(), state };
+  const blob = new Blob([JSON.stringify(payload, null, 1)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "fde-drill-progress-" + localDate() + ".json";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  try { localStorage.setItem(LS_KEY + "-backup", String(Date.now())); } catch (e) {}
+  backupMsg = "Saved to your downloads"; render();
+}
+function readBackup(file) {
+  backupMsg = "";
+  if (!file) return;
+  if (file.size > 2e6) { backupMsg = "That file is too big to be a drill backup."; return render(); }
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const data = JSON.parse(r.result);
+      const st = data && data.app === "fde-drill" ? data.state : data;
+      if (!st || typeof st !== "object" || typeof st.status !== "object") throw new Error("shape");
+      const clean = { updated: Date.now() };
+      STATE_KEYS.forEach(k => { const v = st[k]; clean[k] = v && typeof v === "object" && !Array.isArray(v) ? v : {}; });
+      pendingRestore = { state: clean, when: data.exportedAt ? new Date(data.exportedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "earlier" };
+    } catch (e) { backupMsg = "That file isn't a drill backup."; }
+    render();
+  };
+  r.onerror = () => { backupMsg = "Couldn't read that file."; render(); };
+  r.readAsText(file);
+}
 (async function initStore() {
   try {
     if (!window.claude || !window.claude.use) return;
@@ -386,7 +446,7 @@ function render() {
   const v = document.getElementById("view");
   try { v.innerHTML = ({ problem: () => viewProblem(r.id), template: () => viewTemplate(r.id), problems: viewProblems, help: viewHelp, cards: viewCards, today: viewToday })[r.view](); }
   catch (err) { console.error(err); v.innerHTML = `<section class="panel"><h3>This screen hit a snag</h3><p class="muted">Your progress is safe. Try another tab, then come back.</p></section>`; }
-  v.insertAdjacentHTML("beforeend", `<p class="sync" id="sync">${syncText()}</p>`);
+  v.insertAdjacentHTML("beforeend", `<p class="sync" id="sync">${syncText()}</p>${backupHtml()}`);
   if (r.view === "problem") updateTimer();
 }
 
@@ -809,6 +869,9 @@ document.addEventListener("click", e => {
   else if (act === "filter") { ui.filter = el.dataset.f; render(); }
   else if (act === "reveal") { ui.revealed[id] = (ui.revealed[id] || 0) + 1; render(); }
   else if (act === "detail") { ui.detail[id] = !ui.detail[id]; const y = window.scrollY; render(); window.scrollTo(0, y); }
+  else if (act === "backup") doBackup();
+  else if (act === "restoreYes") { state = Object.assign({ status: {}, statusAt: {}, tasks: {}, cards: {}, activity: {}, puzzle: {}, updated: 0 }, pendingRestore.state); pendingRestore = null; backupMsg = "Progress restored ✓"; persist(); render(); window.scrollTo(0, 0); }
+  else if (act === "restoreNo") { pendingRestore = null; render(); }
   else if (act === "sv") { ui.sv[id] = !ui.sv[id]; const y = window.scrollY; render(); window.scrollTo(0, y); }
   else if (act === "showtpl") { ui.tplShown[id] = true; render(); }
   else if (act === "status") {
@@ -849,6 +912,7 @@ document.addEventListener("click", e => {
 document.addEventListener("change", e => {
   const el = e.target;
   if (el.dataset && el.dataset.act === "task") { if (el.checked) state.tasks[el.dataset.id] = true; else delete state.tasks[el.dataset.id]; touch(); render(); }
+  else if (el.id === "restoreFile") { readBackup(el.files && el.files[0]); el.value = ""; }
   else if (el.id === "onlyAgain") { ui.onlyAgain = el.checked; ui.cardIdx[ui.deck] = 0; ui.flipped = false; render(); }
   else if (el.id === "deckSel") { ui.deck = el.value; ui.flipped = false; saveUi(); render(); }
 });
@@ -856,6 +920,7 @@ document.addEventListener("input", e => {
   if (e.target.id === "tbSearch") { ui.tbq = e.target.value; document.getElementById("helpResults").innerHTML = helpResults(); }
 });
 document.addEventListener("keydown", e => {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches("label.linkbtn")) { e.preventDefault(); e.target.querySelector("input").click(); return; }
   if (route().view !== "cards" || e.target.closest("input, textarea, select")) return;
   if ((e.key === " " && !e.target.closest("button")) || (e.key === "Enter" && e.target.closest(".flash"))) { e.preventDefault(); ui.flipped = !ui.flipped; render(); }
 });
